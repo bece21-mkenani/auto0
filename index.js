@@ -12,11 +12,12 @@ const {
     default: makeWASocket,
     DisconnectReason,
     makeCacheableSignalKeyStore,
+    fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 let latestQR = '';
-let sock = null; // Global socket reference
+let sock = null;
 const chatHistories = new Map();
 const mkenaniLastSpoke = new Map();
 
@@ -49,7 +50,6 @@ app.get('/qr', (req, res) => {
     });
 });
 
-// New endpoint to force clear session and generate fresh QR
 app.get('/clear', async (req, res) => {
     try {
         await AuthState.deleteMany({});
@@ -62,14 +62,8 @@ app.get('/clear', async (req, res) => {
                 <p>Check <a href="/qr">/qr</a> in a few seconds.</p>
             </div>
         `);
-
-        // Force logout if socket exists + restart connection
         if (sock) {
-            try {
-                await sock.logout();
-            } catch (e) {
-                console.log('Logout error during clear (normal if not connected):', e);
-            }
+            try { await sock.logout(); } catch (e) {}
         }
         connectToWhatsApp();
     } catch (error) {
@@ -100,13 +94,13 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const tools = {
     updateUserProfile: async (whatsappId, name, fact) => {
-        const updateOps = {};
-        if (name) updateOps.name = name;
-        if (fact) updateOps.$push = { facts: fact };
-
+        const updateQuery = {
+            ...(name && { $set: { name } }),
+            ...(fact && { $push: { facts: fact } })
+        };
         const user = await User.findOneAndUpdate(
             { whatsappId },
-            updateOps,
+            updateQuery,
             { upsert: true, new: true }
         );
         return `Profile updated for ${user.name || whatsappId}`;
@@ -139,37 +133,48 @@ function getMkenaniStatus() {
     return "currently busy 🛠️";
 }
 
-
+// WhatsApp Connection
 async function connectToWhatsApp() {
     console.log('🔄 Initializing WhatsApp connection...');
 
-    const logger = pino({ level: 'debug' }); 
+    // Fetch latest version to avoid handshake issues
+    let version = [3, 4025, 25]; // safe recent fallback
+    try {
+        const latest = await fetchLatestBaileysVersion();
+        version = latest.version;
+        console.log(`✅ Using latest WhatsApp version: ${version.join('.')}`);
+    } catch (err) {
+        console.log('⚠️ Failed to fetch latest WA version, using fallback:', version.join('.'));
+    }
 
-    const authDoc = await AuthState.findOne({ id: 'auth_state' }) ||
-                    await new AuthState({ id: 'auth_state' }).save();
+    const logger = pino({ level: 'info' }); // Changed to 'info' to reduce noise (use 'debug' only if troubleshooting)
+
+    let authDoc = await AuthState.findOne({ id: 'auth_state' });
+    if (!authDoc) {
+        authDoc = await new AuthState({ id: 'auth_state' }).save();
+    }
 
     const saveCreds = async () => {
-        if (sock) {
+        if (sock?.authState?.creds) {
             authDoc.creds = sock.authState.creds;
             await authDoc.save();
         }
     };
 
     sock = makeWASocket({
+        version,
         auth: {
             creds: authDoc.creds,
             keys: makeCacheableSignalKeyStore({}, logger),
         },
-        printQRInTerminal: true, // Always print QR in logs too
+        printQRInTerminal: false,
         logger,
-        browser: ['Mphatso AI', 'Chrome', '120.0'],
+        browser: ['Mphatso AI', 'Chrome', '131.0.0.0'],
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
-        console.log('🔗 Connection update:', JSON.stringify(update)); 
-
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -179,19 +184,19 @@ async function connectToWhatsApp() {
         }
 
         if (connection === 'close') {
-            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            console.log(`Connection closed. Reason: ${statusCode || 'unknown'}`);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            console.log(`Connection closed. Code: ${statusCode || 'unknown'}`);
 
-            if (statusCode !== DisconnectReason.loggedOut) {
-                console.log('Reconnecting...');
-                connectToWhatsApp();
-            } else {
-                console.log('Logged out – clearing session and starting fresh');
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log('Logged out – clearing session');
                 AuthState.deleteOne({ id: 'auth_state' }).then(() => connectToWhatsApp());
+            } else {
+                console.log('Reconnecting in 10 seconds...');
+                setTimeout(connectToWhatsApp, 10000);
             }
         } else if (connection === 'open') {
             latestQR = '';
-            console.log('🚀 Mphatso is online!');
+            console.log('🚀 Mphatso is online and connected!');
         }
     });
 
@@ -261,12 +266,13 @@ async function connectToWhatsApp() {
     });
 }
 
+// Start everything
 mongoose.connect(process.env.MONGODB_URI).then(async () => {
     console.log('✅ Connected to MongoDB Atlas');
     connectToWhatsApp();
 });
 
-
+// Keep Render awake
 setInterval(() => {
     axios.get(`https://wautomation.onrender.com/`).catch(() => {});
 }, 10 * 60 * 1000);
