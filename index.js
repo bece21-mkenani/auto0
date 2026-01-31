@@ -12,36 +12,34 @@ const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-let latestQR = ""; 
+
+const PORT = process.env.PORT || 10000; 
 
 app.get('/', (req, res) => {
     res.send(`
         <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
-            <h1></h1>
-            <p>To link a new device, go to <a href="https://wautomation.onrender.com/qr">/qr</a></p>
+            <h1>Mphatso AI Status: Active 🚀</h1>
+            <p>To link a new device, go to <a href="/qr">/qr</a></p>
         </div>
     `);
 });
 
-
 app.get('/qr', (req, res) => {
     if (!latestQR) {
-        return res.send("<h1>No QR generated. The bot might already be logged in!</h1>");
+        return res.send("<h1>No QR generated. If you just scanned, wait a moment for 'Ready' status.</h1>");
     }
     QRCode.toDataURL(latestQR, (err, url) => {
         res.send(`
             <div style="text-align:center; font-family:sans-serif; margin-top:20px;">
                 <h2>Scan this with WhatsApp</h2>
                 <img src="${url}" style="border: 15px solid white; box-shadow: 0 0 15px rgba(0,0,0,0.2); width:350px;"/>
-                <p><i>Refreshing this page helps if the scan fails.</i></p>
+                <p><i>Bot will start responding once the QR disappears from this page.</i></p>
             </div>
         `);
     });
 });
 
-app.listen(PORT, () => console.log(`✅ Web Server running on port ${PORT}`));
-
+app.listen(PORT, '0.0.0.0', () => console.log(`✅ Web Server running on port ${PORT}`));
 
 const userSchema = new mongoose.Schema({
     whatsappId: String,
@@ -103,22 +101,37 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
         }),
         puppeteer: {
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox',
+                '--disable-extensions',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process', 
+                '--disable-gpu'
+            ],
+            
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
         }
     });
 
+    let latestQR = ""; 
     client.on('qr', (qr) => {
         latestQR = qr; 
-        console.log('⚡ New QR generated. View it at: /qr');
+        console.log('⚡ New QR received.');
         qrcodeTerminal.generate(qr, { small: false });
     });
 
     client.on('ready', () => {
         latestQR = ""; 
-        console.log('🚀 Mphatso is online!');
+        console.log('🚀 Mphatso is online and ready for messages!');
     });
 
     client.on('message', async (msg) => {
+        console.log(`📩 Message received from ${msg.from}: ${msg.body}`); 
+
         if (msg.from.endsWith('@g.us') || msg.isStatus) return;
         if (msg.fromMe) {
             mkenaniLastSpoke.set(msg.to, Date.now());
@@ -126,7 +139,7 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
         }
 
         const lastMeTime = mkenaniLastSpoke.get(msg.from) || 0;
-        const cooldown = 50 * 60 * 1000; // 50 Minutes
+        const cooldown = 50 * 60 * 1000; 
         
         if (Date.now() - lastMeTime < cooldown) return;
 
@@ -142,10 +155,7 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
                 STATUS: mkenani is ${getMkenaniStatus()}.
                 USER: ${userProfile.name || "Unknown"}.
                 KNOWN FACTS: ${userProfile.facts.join(", ")}.
-
-                STRICT RULES:
-                1. Be extremely brief (Max 2 sentences).
-                2. Use 'updateUserProfile' for names/facts.
+                STRICT RULES: Brief (2 sentences), witty.
             `;
 
             if (!chatHistories.has(msg.from)) {
@@ -170,16 +180,13 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
             }
 
         } catch (error) {
-            if (error.status === 429) {
-                await msg.reply("*AI:* mkenani will respond shortly.");
-            } else {
-                console.error("Bot Error:", error);
-            }
+            console.error("Bot Error:", error);
         }
     });
 
     client.initialize();
 });
+
 
 setInterval(() => {
     axios.get(`https://wautomation.onrender.com/`).catch(() => {});
