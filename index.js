@@ -1,111 +1,132 @@
-const dns = require('node:dns/promises');
-dns.setServers(['8.8.8.8', '1.1.1.1']);
-
-const { Client, RemoteAuth } = require('whatsapp-web.js');
-const { MongoStore } = require('wwebjs-mongo');
-const mongoose = require('mongoose');
-const qrcodeTerminal = require('qrcode-terminal'); 
-const QRCode = require('qrcode');                 
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { 
+    default: makeWASocket, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore, 
+    useMultiFileAuthState,
+    proto
+} = require('@whiskeysockets/baileys');
+const { MongoClient } = require('mongodb');
+const { Boom } = require('@hapi/boom');
+const P = require('pino');
 const express = require('express');
-const axios = require('axios');
+const QRCode = require('qrcode');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 
-// --- GLOBAL STATE ---
-let latestQR = ""; 
-const chatHistories = new Map();
-const mkenaniLastSpoke = new Map(); 
-
-// --- WEB SERVER ---
 const app = express();
-const PORT = process.env.PORT || 10000; 
+const PORT = process.env.PORT || 10000;
+let qrCode = "";
 
-app.get('/', (req, res) => {
-    res.send('<div style="text-align:center;padding:50px;"><h1>Mphatso AI: Active 🚀</h1><p>Visit <a href="/qr">/qr</a> to link.</p></div>');
-});
-
-app.get('/qr', (req, res) => {
-    if (!latestQR) return res.send("<h1>No QR generated. Bot is likely logged in!</h1>");
-    QRCode.toDataURL(latestQR, (err, url) => {
-        res.send(`<div style="text-align:center;"><img src="${url}" width="350"/><p>Scan to Start</p></div>`);
-    });
-});
-
-app.listen(PORT, '0.0.0.0', () => console.log(`✅ Server on port ${PORT}`));
-
-// --- AI SETUP ---
+// AI Setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const userSchema = new mongoose.Schema({ whatsappId: String, name: String, facts: [String] });
-const User = mongoose.model('User', userSchema);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-const model = genAI.getGenerativeModel({ 
-    model: "gemini-2.5-flash", 
-    generationConfig: { maxOutputTokens: 100 }
-});
+// --- MONGODB AUTH STORAGE LOGIC ---
+// This replicates useMultiFileAuthState but inside MongoDB to save RAM/Disk
+async function useMongoDBAuthState(collection) {
+    const writeData = (data, id) => {
+        return collection.replaceOne({ _id: id }, { data: JSON.parse(JSON.stringify(data, (key, value) => typeof value === 'Uint8Array' ? Buffer.from(value).toString('base64') : value)) }, { upsert: true });
+    };
 
-function getStatus() {
-    const hr = new Date().getHours();
-    return (hr >= 23 || hr <= 6) ? "sleeping 😴" : (hr >= 9 && hr <= 17) ? "focus mode 👨‍💻" : "busy 🛠️";
+    const readData = async (id) => {
+        const result = await collection.findOne({ _id: id });
+        if (!result) return null;
+        return JSON.parse(JSON.stringify(result.data), (key, value) => {
+            if (value && typeof value === 'object' && value.type === 'Buffer') return Buffer.from(value.data);
+            return value;
+        });
+    };
+
+    const removeData = async (id) => {
+        await collection.deleteOne({ _id: id });
+    };
+
+    const creds = await readData('creds') || (await useMultiFileAuthState('temp').creds); // Fallback to fresh creds
+
+    return {
+        state: {
+            creds,
+            keys: makeCacheableSignalKeyStore({
+                get: (type, ids) => {
+                    return ids.reduce(async (acc, id) => {
+                        const data = await readData(`${type}-${id}`);
+                        if (data) (await acc)[id] = data;
+                        return acc;
+                    }, Promise.resolve({}));
+                },
+                set: (data) => {
+                    for (const type in data) {
+                        for (const id in data[type]) {
+                            const value = data[type][id];
+                            if (value) writeData(value, `${type}-${id}`);
+                            else removeData(`${type}-${id}`);
+                        }
+                    }
+                }
+            }, P({ level: 'silent' }))
+        },
+        saveCreds: () => writeData(creds, 'creds')
+    };
 }
 
-// --- BOT INITIALIZATION ---
-mongoose.connect(process.env.MONGODB_URI).then(() => {
-    console.log('✅ MongoDB Connected');
+// --- MAIN BOT LOGIC ---
+async function startBot() {
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    const db = client.db('whatsapp_bot');
+    const collection = db.collection('session');
 
-    const client = new Client({
-        authStrategy: new RemoteAuth({
-            store: new MongoStore({ mongoose }),
-            backupSyncIntervalMs: 300000 
-        }),
-        webVersionCache: {
-            type: 'remote',
-            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-        },
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox', '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', '--shm-size=1gb'
-            ],
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    const { state, saveCreds } = await useMongoDBAuthState(collection);
+    const { version } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true,
+        logger: P({ level: 'silent' }),
+        browser: ['Mphatso Assistant', 'Chrome', '1.0.0']
+    });
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) qrCode = qr;
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error instanceof Boom) 
+                ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut 
+                : true;
+            if (shouldReconnect) startBot();
+        } else if (connection === 'open') {
+            qrCode = "";
+            console.log('🚀 MPHATSO IS ONLINE & LOGGED INTO MONGO');
         }
     });
 
-    client.on('qr', qr => { latestQR = qr; qrcodeTerminal.generate(qr, { small: true }); });
+    sock.ev.on('creds.update', saveCreds);
 
-    client.on('ready', () => { 
-        latestQR = ""; 
-        console.log('🚀 MPHATSO IS ONLINE AND RECEIVING MESSAGES!'); 
-    });
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe || type !== 'notify') return;
 
-    client.on('message', async (msg) => {
-        // Log incoming for debugging
-        console.log(`📩 New message from ${msg.from}: ${msg.body}`);
-
-        if (msg.from.endsWith('@g.us') || msg.isStatus) return;
-        if (msg.fromMe) { mkenaniLastSpoke.set(msg.to, Date.now()); return; }
-
-        const cooldown = 50 * 60 * 1000; 
-        if (Date.now() - (mkenaniLastSpoke.get(msg.from) || 0) < cooldown) return;
+        const sender = msg.key.remoteJid;
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+        if (!text) return;
 
         try {
-            const chat = await msg.getChat();
-            await chat.sendStateTyping(); // This should now trigger
-
-            let profile = await User.findOne({ whatsappId: msg.from }) || 
-                         await User.create({ whatsappId: msg.from, facts: [] });
-
-            const prompt = `Name: Mphatso. Boss: mkenani (currently ${getStatus()}). User: ${profile.name || "New friend"}. Rules: Brief (2 sentences), witty. Response:`;
-            
-            if (!chatHistories.has(msg.from)) chatHistories.set(msg.from, model.startChat());
-            const result = await chatHistories.get(msg.from).sendMessage(prompt + msg.body);
-            
-            await msg.reply(`*AI:* ${result.response.text()}`);
+            await sock.sendPresenceUpdate('composing', sender);
+            const prompt = `Assistant: Mphatso. Rule: 2 sentences max. User says: ${text}`;
+            const result = await model.generateContent(prompt);
+            await sock.sendMessage(sender, { text: `*AI:* ${result.response.text()}` });
         } catch (e) { console.error("Error:", e); }
     });
+}
 
-    client.initialize();
+// Web Server
+app.get('/', (req, res) => res.send('Bot is active. Check /qr.'));
+app.get('/qr', async (req, res) => {
+    if (!qrCode) return res.send('Connected.');
+    const url = await QRCode.toDataURL(qrCode);
+    res.send(`<img src="${url}" width="300">`);
 });
 
-// Keep-alive ping
-setInterval(() => axios.get(`https://wautomation.onrender.com/`).catch(() => {}), 600000);
+app.listen(PORT, '0.0.0.0', () => startBot());
