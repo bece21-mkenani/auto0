@@ -71,7 +71,7 @@ async function processQueue(sock) {
             if (aiErr.message.includes('429') || aiErr.message.includes('quota')) {
                 await sock.sendPresenceUpdate('paused', sender); // STOP TYPING
                 await sock.sendMessage(sender, { 
-                    text: "Mkena will be back shortly!" 
+                    text: "Mkenani will be back shortly!" 
                 }, { quoted: m });
             } else {
                 throw aiErr; // Pass other errors to the main catch
