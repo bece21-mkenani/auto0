@@ -103,20 +103,25 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
             store: new MongoStore({ mongoose }),
             backupSyncIntervalMs: 300000 
         }),
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--single-process'
-            ],
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
-        }
+ puppeteer: {
+    headless: true,
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+    ],
+
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
     });
 
     client.on('qr', (qr) => {
-        latestQR = qr; // Updating global variable
+        latestQR = qr; 
         console.log('⚡ New QR received. Scan at /qr');
         qrcodeTerminal.generate(qr, { small: false });
     });
