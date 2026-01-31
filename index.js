@@ -19,14 +19,11 @@ const PORT = process.env.PORT || 10000;
 let qrCode = "";
 let db, sessionCol, userCol;
 
-// AI Setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-// Helper: Delay
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- MESSAGE QUEUE SYSTEM ---
 const messageQueue = [];
 let isProcessing = false;
 
@@ -37,7 +34,6 @@ async function processQueue(sock) {
     const { m, sender, text } = messageQueue.shift();
 
     try {
-        // 1. Fetch/Create User Memory
         let userData = await userCol.findOne({ _id: sender });
         if (!userData) {
             userData = { _id: sender, name: "Unknown", facts: [], firstSeen: new Date() };
@@ -47,9 +43,7 @@ async function processQueue(sock) {
         const hour = new Date().getHours();
         const bossStatus = (hour >= 23 || hour <= 6) ? "sleeping 😴" : (hour >= 9 && hour <= 17) ? "focus mode 👨‍💻" : "busy 🛠️";
 
-        // 2. Premium Human Presence
-        // We wait a bit before "Typing" to look like we are reading
-        await delay(1500); 
+        await delay(10); 
         await sock.sendPresenceUpdate('composing', sender);
 
         const systemInstruction = `
@@ -67,14 +61,11 @@ async function processQueue(sock) {
         const result = await model.generateContent(`${systemInstruction}\n\nUser: ${text}`);
         let responseText = result.response.text().trim().split('\n').slice(0, 2).join('\n');
 
-        // 3. Humanized Typing Speed (Calculated by length)
         const typingDuration = Math.min(Math.max(responseText.length * 60, 2000), 6000);
         await delay(typingDuration);
 
-        // 4. Send Reply (Quoted for clarity)
         await sock.sendMessage(sender, { text: responseText }, { quoted: m });
 
-        // 5. Update Memory if AI detected a name or fact (Background process)
         if (text.toLowerCase().includes("my name is") || text.toLowerCase().includes("i am")) {
             const nameMatch = text.match(/(?:my name is|i am)\s+([a-zA-Z]+)/i);
             if (nameMatch) await userCol.updateOne({ _id: sender }, { $set: { name: nameMatch[1] } });
@@ -83,20 +74,21 @@ async function processQueue(sock) {
     } catch (err) {
         console.error("Mphatso Premium Error:", err.message);
     } finally {
-        // We leave the status alone for a few seconds before finishing to look natural
         await delay(1000);
         isProcessing = false;
         processQueue(sock);
     }
 }
 
-// --- MONGODB AUTH STORAGE ---
 async function useMongoDBAuthState(collection) {
-    const writeData = (data, id) => collection.replaceOne({ _id: id }, { data: JSON.stringify(data, BufferJSON.replacer) }, { upsert: true });
+    const writeData = (data, id) =>
+        collection.replaceOne({ _id: id }, { data: JSON.stringify(data, BufferJSON.replacer) }, { upsert: true });
+
     const readData = async (id) => {
         const res = await collection.findOne({ _id: id });
         return res ? JSON.parse(res.data, BufferJSON.reviver) : null;
     };
+
     const removeData = async (id) => collection.deleteOne({ _id: id });
 
     let creds = await readData('creds');
@@ -133,7 +125,6 @@ async function useMongoDBAuthState(collection) {
     };
 }
 
-// --- START ENGINE ---
 async function startBot() {
     try {
         const mClient = new MongoClient(process.env.MONGODB_URI);
@@ -150,7 +141,7 @@ async function startBot() {
             auth: state,
             logger: P({ level: 'error' }),
             browser: ['Mphatso Premium', 'Chrome', '1.0.0'],
-            markOnlineOnConnect: false // Stay offline to look like a person
+            markOnlineOnConnect: false
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -159,8 +150,9 @@ async function startBot() {
             const { connection, lastDisconnect, qr } = upd;
             if (qr) qrCode = qr;
             if (connection === 'close') {
-                const shouldReconnect = (lastDisconnect?.error instanceof Boom) && 
-                                       lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
+                const shouldReconnect =
+                    (lastDisconnect?.error instanceof Boom) &&
+                    lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
                 if (shouldReconnect) startBot();
             } else if (connection === 'open') {
                 qrCode = "";
@@ -170,7 +162,6 @@ async function startBot() {
 
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             const m = messages[0];
-            // Rule: No groups, no self, only notifications
             if (!m.message || m.key.fromMe || m.key.remoteJid.endsWith('@g.us') || type !== 'notify') return;
 
             const text = m.message.conversation || m.message.extendedTextMessage?.text || "";
@@ -186,7 +177,6 @@ async function startBot() {
     }
 }
 
-// Web Routes
 app.get('/', (req, res) => res.send('Premium Assistant: Active'));
 app.get('/qr', async (req, res) => {
     if (!qrCode) return res.send('Connected.');
