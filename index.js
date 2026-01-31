@@ -19,11 +19,11 @@ const PORT = process.env.PORT || 10000;
 let qrCode = "";
 let db, sessionCol, userCol;
 
-// AI Configuration
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Note: Using 1.5-flash as it is the stable production model
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-// --- INSTANT QUEUE SYSTEM ---
+// --- QUEUE SYSTEM ---
 const messageQueue = [];
 let isProcessing = false;
 
@@ -34,7 +34,6 @@ async function processQueue(sock) {
     const { m, sender, text } = messageQueue.shift();
 
     try {
-        // 1. Database Lookup (Memory)
         let userData = await userCol.findOne({ _id: sender });
         if (!userData) {
             userData = { _id: sender, name: "Unknown", facts: [], firstSeen: new Date() };
@@ -44,41 +43,52 @@ async function processQueue(sock) {
         const hour = new Date().getHours();
         const bossStatus = (hour >= 23 || hour <= 6) ? "sleeping 😴" : (hour >= 9 && hour <= 17) ? "focus mode 👨‍💻" : "busy 🛠️";
 
-        // 2. Instant Presence
+        // 1. Start typing
         await sock.sendPresenceUpdate('composing', sender);
 
         const systemInstruction = `
-            Your name is Mphatso, assistant to mkenani. 
-            Boss Status: mkenani is ${bossStatus}. 
-            User Context: Name is "${userData.name}". Memory: ${userData.facts.join(", ") || "None"}.
-            Style: Helpful, witty, human-like. 
-            RULE: Max 2 lines. Respond INSTANTLY. No fluff.
+            Your name is VEGA, assistant to mkenani. 
+            mkenani is ${bossStatus}. 
+            User Name: "${userData.name}". Facts: ${userData.facts.join(", ") || "None"}.
+            Style: Friendly, witty, human-like. 
+            STRICT RULE: Max 2 lines. Respond INSTANTLY.
         `;
 
-        // 3. AI Generation
-        const result = await model.generateContent(`${systemInstruction}\n\nUser: ${text}`);
-        const responseText = result.response.text().trim().split('\n').slice(0, 2).join('\n');
+        try {
+            const result = await model.generateContent(`${systemInstruction}\n\nUser: ${text}`);
+            let responseText = result.response.text().trim().split('\n').slice(0, 2).join('\n');
 
-        // 4. Instant Delivery
-        await sock.sendMessage(sender, { text: responseText }, { quoted: m });
-        await sock.readMessages([m.key]);
+            await sock.sendMessage(sender, { text: responseText }, { quoted: m });
+            await sock.readMessages([m.key]);
 
-        // 5. Dynamic Memory Learning
-        const nameMatch = text.match(/(?:my name is|call me|i am)\s+([a-zA-Z]+)/i);
-        if (nameMatch) {
-            await userCol.updateOne({ _id: sender }, { $set: { name: nameMatch[1] } });
+            // Learning names
+            if (text.toLowerCase().includes("my name is") || text.toLowerCase().includes("call me")) {
+                const nameMatch = text.match(/(?:my name is|call me)\s+([a-zA-Z]+)/i);
+                if (nameMatch) await userCol.updateOne({ _id: sender }, { $set: { name: nameMatch[1] } });
+            }
+        } catch (aiErr) {
+            // Check for Rate Limit (429)
+            if (aiErr.message.includes('429') || aiErr.message.includes('quota')) {
+                await sock.sendPresenceUpdate('paused', sender); // STOP TYPING
+                await sock.sendMessage(sender, { 
+                    text: "Mkena will be back shortly!" 
+                }, { quoted: m });
+            } else {
+                throw aiErr; // Pass other errors to the main catch
+            }
         }
 
     } catch (err) {
-        console.error("Mphatso Error:", err.message);
+        console.error("Processing Error:", err.message);
     } finally {
         await sock.sendPresenceUpdate('paused', sender);
         isProcessing = false;
-        processQueue(sock); // Move to next message immediately
+        // Small safety delay before processing next message to prevent spam-looping 429s
+        setTimeout(() => processQueue(sock), 500);
     }
 }
 
-// --- MONGODB AUTH (auth_v7 - Clean Start) ---
+// --- MONGODB AUTH STORAGE (auth_v7) ---
 async function useMongoDBAuthState(collection) {
     const writeData = (data, id) => collection.replaceOne({ _id: id }, { data: JSON.stringify(data, BufferJSON.replacer) }, { upsert: true });
     const readData = async (id) => {
@@ -121,13 +131,13 @@ async function useMongoDBAuthState(collection) {
     };
 }
 
-// --- CORE BOT ENGINE ---
+// --- START ENGINE ---
 async function startBot() {
     try {
         const mClient = new MongoClient(process.env.MONGODB_URI);
         await mClient.connect();
         db = mClient.db('MphatsoPremium'); 
-        sessionCol = db.collection('auth_v7'); // Fresh collection
+        sessionCol = db.collection('auth_v7'); // Version bump for clean start
         userCol = db.collection('user_memory'); 
 
         const { state, saveCreds } = await useMongoDBAuthState(sessionCol);
@@ -137,9 +147,8 @@ async function startBot() {
             version,
             auth: state,
             logger: P({ level: 'error' }),
-            browser: ['Mphatso V7', 'Chrome', '1.0.0'],
-            markOnlineOnConnect: false,
-            generateHighQualityLinkPreview: true
+            browser: ['Mphatso Premium', 'Chrome', '1.0.0'],
+            markOnlineOnConnect: false
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -169,24 +178,14 @@ async function startBot() {
         });
 
     } catch (err) {
-        console.error("Startup Failure:", err);
+        console.error("Start Error:", err);
         setTimeout(startBot, 10000);
     }
 }
 
-// --- WEB ROUTES ---
-app.get('/', (req, res) => res.send('Mphatso Premium: Always Online'));
+app.get('/', (req, res) => res.send('Mphatso Instant: Active'));
 app.get('/qr', async (req, res) => {
-    if (!qrCode) return res.send('<h1>✅ Bot Connected Successfully</h1>');
-    QRCode.toDataURL(qrCode, (err, url) => {
-        res.send(`
-            <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
-                <h2>Scan to Connect Mphatso</h2>
-                <img src="${url}" style="border: 10px solid #25D366; border-radius:15px;"/>
-                <p>Refresh page if QR doesn't load.</p>
-            </div>
-        `);
-    });
+    if (!qrCode) return res.send('Connected.');
+    QRCode.toDataURL(qrCode, (err, url) => res.send(`<img src="${url}">`));
 });
-
 app.listen(PORT, '0.0.0.0', () => startBot());
