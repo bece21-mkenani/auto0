@@ -4,9 +4,43 @@ dns.setServers(['8.8.8.8', '1.1.1.1']);
 const { Client, RemoteAuth } = require('whatsapp-web.js');
 const { MongoStore } = require('wwebjs-mongo');
 const mongoose = require('mongoose');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal'); 
+const QRCode = require('qrcode');                 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const express = require('express');
+const axios = require('axios');
 require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+let latestQR = ""; 
+
+app.get('/', (req, res) => {
+    res.send(`
+        <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
+            <h1>Mphatso Assistant Status: 🚀 Online</h1>
+            <p>To link a new device, go to <a href="/qr">/qr</a></p>
+        </div>
+    `);
+});
+
+
+app.get('/qr', (req, res) => {
+    if (!latestQR) {
+        return res.send("<h1>No QR generated. The bot might already be logged in!</h1>");
+    }
+    QRCode.toDataURL(latestQR, (err, url) => {
+        res.send(`
+            <div style="text-align:center; font-family:sans-serif; margin-top:20px;">
+                <h2>Scan this with WhatsApp</h2>
+                <img src="${url}" style="border: 15px solid white; box-shadow: 0 0 15px rgba(0,0,0,0.2); width:350px;"/>
+                <p><i>Refreshing this page helps if the scan fails.</i></p>
+            </div>
+        `);
+    });
+});
+
+app.listen(PORT, () => console.log(`✅ Web Server running on port ${PORT}`));
 
 
 const userSchema = new mongoose.Schema({
@@ -16,10 +50,7 @@ const userSchema = new mongoose.Schema({
     lastInteraction: Date
 });
 const User = mongoose.model('User', userSchema);
-
-
 const mkenaniLastSpoke = new Map(); 
-
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const tools = {
@@ -62,7 +93,6 @@ function getMkenaniStatus() {
     return "currently busy 🛠️";
 }
 
-
 mongoose.connect(process.env.MONGODB_URI).then(() => {
     console.log('✅ Connected to MongoDB Atlas');
 
@@ -78,14 +108,17 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
     });
 
     client.on('qr', (qr) => {
-        console.log('⚡ QR Code generated! Scan it quickly:');
-        qrcode.generate(qr, { small: false });
+        latestQR = qr; 
+        console.log('⚡ New QR generated. View it at: /qr');
+        qrcodeTerminal.generate(qr, { small: false });
     });
 
-    client.on('ready', () => console.log('🚀 Mphatso is online!'));
+    client.on('ready', () => {
+        latestQR = ""; 
+        console.log('🚀 Mphatso is online!');
+    });
 
     client.on('message', async (msg) => {
-       
         if (msg.from.endsWith('@g.us') || msg.isStatus) return;
         if (msg.fromMe) {
             mkenaniLastSpoke.set(msg.to, Date.now());
@@ -93,11 +126,9 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
         }
 
         const lastMeTime = mkenaniLastSpoke.get(msg.from) || 0;
-        const cooldown = 50 * 60 * 1000; 
+        const cooldown = 50 * 60 * 1000; // 50 Minutes
         
-        if (Date.now() - lastMeTime < cooldown) {
-            return;
-        }
+        if (Date.now() - lastMeTime < cooldown) return;
 
         try {
             const chat = await msg.getChat();
@@ -107,15 +138,14 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
                               await User.create({ whatsappId: msg.from, facts: [] });
 
             const systemInstruction = `
-                Your name is Mphatso, personal assistant to mkenani. 
+                Your name is Mphatso, assistant to mkenani. 
                 STATUS: mkenani is ${getMkenaniStatus()}.
                 USER: ${userProfile.name || "Unknown"}.
                 KNOWN FACTS: ${userProfile.facts.join(", ")}.
 
                 STRICT RULES:
                 1. Be extremely brief (Max 2 sentences).
-                2. Be witty.
-                3. Use 'updateUserProfile' for names/facts.
+                2. Use 'updateUserProfile' for names/facts.
             `;
 
             if (!chatHistories.has(msg.from)) {
@@ -141,7 +171,7 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
 
         } catch (error) {
             if (error.status === 429) {
-                await msg.reply("*AI:* Give me a sec, mkenani will respond shortly.");
+                await msg.reply("*AI:* mkenani will respond shortly.");
             } else {
                 console.error("Bot Error:", error);
             }
@@ -151,20 +181,6 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
     client.initialize();
 });
 
-
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.send('Mphatso Assistant is alive and breathing! 🚀');
-});
-
-app.listen(PORT, () => {
-    console.log(`Health check server running on port ${PORT}`);
-});
-
-const axios = require('axios');
 setInterval(() => {
-    axios.get(`https://wautomation.onrender.com/`).catch(err => console.log("Ping failed, but that's okay."));
-}, 10 * 60 * 1000); 
+    axios.get(`https://wautomation.onrender.com/`).catch(() => {});
+}, 10 * 60 * 1000);
