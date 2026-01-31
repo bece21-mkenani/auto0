@@ -20,20 +20,20 @@ let qrCode = "";
 let db, sessionCol, userCol;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
+// --- QUEUE SYSTEM ---
 const messageQueue = [];
 let isProcessing = false;
 
 async function processQueue(sock) {
     if (isProcessing || messageQueue.length === 0) return;
     isProcessing = true;
-
+    
     const { m, sender, text } = messageQueue.shift();
 
     try {
+        // Fetch/Create User Memory from separate 'user_memory' collection
         let userData = await userCol.findOne({ _id: sender });
         if (!userData) {
             userData = { _id: sender, name: "Unknown", facts: [], firstSeen: new Date() };
@@ -43,52 +43,48 @@ async function processQueue(sock) {
         const hour = new Date().getHours();
         const bossStatus = (hour >= 23 || hour <= 6) ? "sleeping 😴" : (hour >= 9 && hour <= 17) ? "focus mode 👨‍💻" : "busy 🛠️";
 
-        await delay(10); 
+        // 1. INSTANT: Start typing indicator immediately
         await sock.sendPresenceUpdate('composing', sender);
 
         const systemInstruction = `
-            Your name is Mphatso, personal assistant to mkenani.
-            Boss Status: mkenani is currently ${bossStatus}.
-            User Memory: Name is "${userData.name}". Facts: ${userData.facts.join(", ") || "None yet"}.
-            
-            GOALS:
-            1. Be helpful, witty, and extremely friendly.
-            2. If you don't know the user's name, ask for it naturally.
-            3. If they tell you a fact about themselves, acknowledge it.
-            4. Keep responses under 2 lines. 
+            Your name is Mphatso, assistant to mkenani. 
+            mkenani is ${bossStatus}. 
+            User Name: "${userData.name}". Facts: ${userData.facts.join(", ") || "None"}.
+            Style: Friendly, witty, human-like. 
+            STRICT RULE: Max 2 lines. Respond INSTANTLY.
         `;
 
         const result = await model.generateContent(`${systemInstruction}\n\nUser: ${text}`);
         let responseText = result.response.text().trim().split('\n').slice(0, 2).join('\n');
 
-        const typingDuration = Math.min(Math.max(responseText.length * 60, 2000), 6000);
-        await delay(typingDuration);
-
+        // 2. INSTANT: Send message without artificial waiting
         await sock.sendMessage(sender, { text: responseText }, { quoted: m });
+        
+        // Mark as read after responding
+        await sock.readMessages([m.key]);
 
-        if (text.toLowerCase().includes("my name is") || text.toLowerCase().includes("i am")) {
-            const nameMatch = text.match(/(?:my name is|i am)\s+([a-zA-Z]+)/i);
+        // Background: Auto-learn names
+        if (text.toLowerCase().includes("my name is") || text.toLowerCase().includes("call me")) {
+            const nameMatch = text.match(/(?:my name is|call me)\s+([a-zA-Z]+)/i);
             if (nameMatch) await userCol.updateOne({ _id: sender }, { $set: { name: nameMatch[1] } });
         }
 
     } catch (err) {
-        console.error("Mphatso Premium Error:", err.message);
+        console.error("Processing Error:", err.message);
     } finally {
-        await delay(1000);
+        await sock.sendPresenceUpdate('paused', sender);
         isProcessing = false;
         processQueue(sock);
     }
 }
 
+// --- MONGODB AUTH STORAGE (auth_v4) ---
 async function useMongoDBAuthState(collection) {
-    const writeData = (data, id) =>
-        collection.replaceOne({ _id: id }, { data: JSON.stringify(data, BufferJSON.replacer) }, { upsert: true });
-
+    const writeData = (data, id) => collection.replaceOne({ _id: id }, { data: JSON.stringify(data, BufferJSON.replacer) }, { upsert: true });
     const readData = async (id) => {
         const res = await collection.findOne({ _id: id });
         return res ? JSON.parse(res.data, BufferJSON.reviver) : null;
     };
-
     const removeData = async (id) => collection.deleteOne({ _id: id });
 
     let creds = await readData('creds');
@@ -125,13 +121,14 @@ async function useMongoDBAuthState(collection) {
     };
 }
 
+// --- START ENGINE ---
 async function startBot() {
     try {
         const mClient = new MongoClient(process.env.MONGODB_URI);
         await mClient.connect();
-        db = mClient.db('MphatsoAssistant'); 
-        sessionCol = db.collection('auth_session'); 
-        userCol = db.collection('user_memory');    
+        db = mClient.db('MphatsoPremium'); 
+        sessionCol = db.collection('auth_v4'); 
+        userCol = db.collection('user_memory'); 
 
         const { state, saveCreds } = await useMongoDBAuthState(sessionCol);
         const { version } = await fetchLatestBaileysVersion();
@@ -140,7 +137,7 @@ async function startBot() {
             version,
             auth: state,
             logger: P({ level: 'error' }),
-            browser: ['Mphatso Premium', 'Chrome', '1.0.0'],
+            browser: ['Mphatso Assistant', 'Chrome', '1.0.0'],
             markOnlineOnConnect: false
         });
 
@@ -150,13 +147,12 @@ async function startBot() {
             const { connection, lastDisconnect, qr } = upd;
             if (qr) qrCode = qr;
             if (connection === 'close') {
-                const shouldReconnect =
-                    (lastDisconnect?.error instanceof Boom) &&
-                    lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
+                const shouldReconnect = (lastDisconnect?.error instanceof Boom) && 
+                                       lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
                 if (shouldReconnect) startBot();
             } else if (connection === 'open') {
                 qrCode = "";
-                console.log('🚀 MPHATSO PREMIUM IS LIVE');
+                console.log('🚀 MPHATSO INSTANT IS ONLINE');
             }
         });
 
@@ -172,15 +168,14 @@ async function startBot() {
         });
 
     } catch (err) {
-        console.error("Engine Start Fail:", err);
+        console.error("Start Error:", err);
         setTimeout(startBot, 10000);
     }
 }
 
-app.get('/', (req, res) => res.send('Premium Assistant: Active'));
+app.get('/', (req, res) => res.send('Mphatso Instant: Active'));
 app.get('/qr', async (req, res) => {
     if (!qrCode) return res.send('Connected.');
     QRCode.toDataURL(qrCode, (err, url) => res.send(`<img src="${url}">`));
 });
-
 app.listen(PORT, '0.0.0.0', () => startBot());
