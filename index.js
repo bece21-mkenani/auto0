@@ -20,26 +20,23 @@ let qrCode = "";
 
 // AI Setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// --- MONGODB AUTH STORAGE (STABLE VERSION) ---
+// Helper: Delay function
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- MONGODB AUTH STORAGE ---
 async function useMongoDBAuthState(collection) {
     const writeData = (data, id) => {
-        // Use Baileys' native BufferJSON to convert Buffers to safe JSON
         const jsonStr = JSON.stringify(data, BufferJSON.replacer);
         return collection.replaceOne({ _id: id }, { data: jsonStr }, { upsert: true });
     };
-
     const readData = async (id) => {
         const result = await collection.findOne({ _id: id });
-        if (!result) return null;
-        // Convert back to original types (especially Buffers)
-        return JSON.parse(result.data, BufferJSON.reviver);
+        return result ? JSON.parse(result.data, BufferJSON.reviver) : null;
     };
-
     const removeData = async (id) => collection.deleteOne({ _id: id });
 
-    // Load or Initialize Credentials
     let creds = await readData('creds');
     if (!creds) {
         const { state } = await useMultiFileAuthState('temp_dir');
@@ -74,7 +71,7 @@ async function useMongoDBAuthState(collection) {
     };
 }
 
-// --- MAIN BOT LOGIC ---
+// --- MAIN BOT ---
 async function startBot() {
     try {
         const mClient = new MongoClient(process.env.MONGODB_URI);
@@ -89,28 +86,17 @@ async function startBot() {
             version,
             auth: state,
             logger: P({ level: 'error' }),
-            browser: ['Mphatso AI', 'Chrome', '1.0.0'],
-            generateHighQualityLinkPreview: true
+            browser: ['Mphatso Assistant', 'Chrome', '1.0.0']
         });
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
-            if (qr) {
-                qrCode = qr;
-                console.log('⚡ QR Ready! Scan at /qr');
-            }
+            if (qr) qrCode = qr;
             if (connection === 'close') {
-                const statusCode = (lastDisconnect?.error instanceof Boom) 
-                    ? lastDisconnect.error.output.statusCode 
-                    : 500;
-                
-                // Only stop if logged out, otherwise always reconnect
-                if (statusCode !== DisconnectReason.loggedOut) {
-                    console.log('🔄 Reconnecting in 5s...');
-                    setTimeout(startBot, 5000);
-                } else {
-                    console.log('❌ Logged out. Delete Mongo collection and restart.');
-                }
+                const shouldReconnect = (lastDisconnect?.error instanceof Boom) 
+                    ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut 
+                    : true;
+                if (shouldReconnect) startBot();
             } else if (connection === 'open') {
                 qrCode = "";
                 console.log('🚀 Mphatso AI is Online!');
@@ -127,10 +113,41 @@ async function startBot() {
             const text = m.message.conversation || m.message.extendedTextMessage?.text;
             if (!text) return;
 
+            // Personal Assistant Logic
+            const hour = new Date().getHours();
+            const bossStatus = (hour >= 23 || hour <= 6) ? "sleeping 😴" : (hour >= 9 && hour <= 17) ? "focus mode 👨‍💻" : "busy 🛠️";
+
             try {
+                // 1. Mark as Read
+                await sock.readMessages([m.key]);
+
+                // 2. Start Typing Indicator
                 await sock.sendPresenceUpdate('composing', sender);
-                const response = await model.generateContent(`Assistant: Mphatso. Tone: Helpful & Witty. Brief. User: ${text}`);
-                await sock.sendMessage(sender, { text: `*AI:* ${response.response.text()}` });
+
+                const systemInstruction = `
+                    Your name is Mphatso, assistant to mkenani.
+                    Current Status: mkenani is ${bossStatus}.
+                    Instructions: Be extremely friendly, witty, and helpful.
+                    STRICT LIMIT: Maximum 2 lines of text.
+                `;
+
+                const result = await model.generateContent(`${systemInstruction}\n\nUser: ${text}`);
+                let responseText = result.response.text().trim();
+
+                // Ensure 2-line limit
+                responseText = responseText.split('\n').slice(0, 2).join('\n');
+
+                // 3. Simulated "Letter by Letter" Delay
+                // Calculation: ~50ms per character (minimum 1.5s, maximum 6s)
+                const typingTime = Math.min(Math.max(responseText.length * 50, 1500), 6000);
+                await delay(typingTime);
+
+                // 4. Send Message
+                await sock.sendMessage(sender, { text: responseText });
+                
+                // 5. Stop Typing
+                await sock.sendPresenceUpdate('paused', sender);
+
             } catch (err) {
                 console.error("Gemini Error:", err.message);
             }
@@ -142,12 +159,12 @@ async function startBot() {
     }
 }
 
-// Web Server
-app.get('/', (req, res) => res.send('Bot Status: Active'));
+
+app.get('/', (req, res) => res.send('Mphatso AI is running.'));
 app.get('/qr', async (req, res) => {
-    if (!qrCode) return res.send('<h1>Connected Successfully!</h1>');
+    if (!qrCode) return res.send('<h1>Connected.</h1>');
     QRCode.toDataURL(qrCode, (err, url) => {
-        res.send(`<div style="text-align:center;"><h2>Scan to Link Bot</h2><img src="${url}"/></div>`);
+        res.send(`<div style="text-align:center;"><h2>Scan to Link</h2><img src="${url}"/></div>`);
     });
 });
 

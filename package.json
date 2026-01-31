@@ -1,5 +1,5 @@
 {
-  "name": "mphatso-baileys-mongo",
+  "name": "mphatso-baileys-ai",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -12,7 +12,7 @@
     "qrcode": "^1.5.4",
     "pino": "^9.0.0",
     "mongoose": "^8.9.5",
-    "dotenv": "^16.4.7",
-    "mongodb": "^6.0.0"
+    "mongodb": "^6.0.0",
+    "dotenv": "^16.4.7"
   }
 }
