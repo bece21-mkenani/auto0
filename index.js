@@ -11,8 +11,13 @@ const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
 
-const app = express();
 
+let latestQR = ""; 
+const chatHistories = new Map();
+const mkenaniLastSpoke = new Map(); 
+
+
+const app = express();
 const PORT = process.env.PORT || 10000; 
 
 app.get('/', (req, res) => {
@@ -25,15 +30,17 @@ app.get('/', (req, res) => {
 });
 
 app.get('/qr', (req, res) => {
+
     if (!latestQR) {
-        return res.send("<h1>No QR generated. If you just scanned, wait a moment for 'Ready' status.</h1>");
+        return res.send("<h1>No QR generated. The bot might already be logged in!</h1>");
     }
     QRCode.toDataURL(latestQR, (err, url) => {
+        if (err) return res.send("Error generating QR image.");
         res.send(`
             <div style="text-align:center; font-family:sans-serif; margin-top:20px;">
                 <h2>Scan this with WhatsApp</h2>
                 <img src="${url}" style="border: 15px solid white; box-shadow: 0 0 15px rgba(0,0,0,0.2); width:350px;"/>
-                <p><i>Bot will start responding once the QR disappears from this page.</i></p>
+                <p><i>The QR refreshes automatically. Scan it quickly!</i></p>
             </div>
         `);
     });
@@ -48,7 +55,6 @@ const userSchema = new mongoose.Schema({
     lastInteraction: Date
 });
 const User = mongoose.model('User', userSchema);
-const mkenaniLastSpoke = new Map(); 
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const tools = {
@@ -82,8 +88,6 @@ const model = genAI.getGenerativeModel({
     generationConfig: { maxOutputTokens: 80 }
 });
 
-const chatHistories = new Map();
-
 function getMkenaniStatus() {
     const hour = new Date().getHours();
     if (hour >= 23 || hour <= 6) return "sleeping 😴";
@@ -104,35 +108,27 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
-                '--disable-extensions',
                 '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process', 
-                '--disable-gpu'
+                '--single-process'
             ],
-            
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
         }
     });
 
-    let latestQR = ""; 
     client.on('qr', (qr) => {
-        latestQR = qr; 
-        console.log('⚡ New QR received.');
+        latestQR = qr; // Updating global variable
+        console.log('⚡ New QR received. Scan at /qr');
         qrcodeTerminal.generate(qr, { small: false });
     });
 
     client.on('ready', () => {
         latestQR = ""; 
-        console.log('🚀 Mphatso is online and ready for messages!');
+        console.log('🚀 Mphatso is online!');
     });
 
     client.on('message', async (msg) => {
-        console.log(`📩 Message received from ${msg.from}: ${msg.body}`); 
-
         if (msg.from.endsWith('@g.us') || msg.isStatus) return;
+        
         if (msg.fromMe) {
             mkenaniLastSpoke.set(msg.to, Date.now());
             return;
@@ -140,7 +136,6 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
 
         const lastMeTime = mkenaniLastSpoke.get(msg.from) || 0;
         const cooldown = 50 * 60 * 1000; 
-        
         if (Date.now() - lastMeTime < cooldown) return;
 
         try {
@@ -151,11 +146,11 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
                               await User.create({ whatsappId: msg.from, facts: [] });
 
             const systemInstruction = `
-                Your name is Mphatso, assistant to mkenani. 
+                Your name is Mphatso, personal assistant to mkenani. 
                 STATUS: mkenani is ${getMkenaniStatus()}.
                 USER: ${userProfile.name || "Unknown"}.
                 KNOWN FACTS: ${userProfile.facts.join(", ")}.
-                STRICT RULES: Brief (2 sentences), witty.
+                RULES: Brief (2 sentences), witty.
             `;
 
             if (!chatHistories.has(msg.from)) {
@@ -173,7 +168,7 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
             if (call && call.name === "updateUserProfile") {
                 const { name, fact } = call.args;
                 await tools.updateUserProfile(msg.from, name, fact);
-                const followUp = await userChat.sendMessage("Give a 1-sentence confirmation.");
+                const followUp = await userChat.sendMessage("Confirm in 1 sentence.");
                 await msg.reply(`*AI:* ${followUp.response.text()}`);
             } else {
                 await msg.reply(`*AI:* ${result.response.text()}`);
@@ -186,7 +181,6 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
 
     client.initialize();
 });
-
 
 setInterval(() => {
     axios.get(`https://wautomation.onrender.com/`).catch(() => {});
