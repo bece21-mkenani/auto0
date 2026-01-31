@@ -19,7 +19,7 @@ app.get('/', (req, res) => {
     res.send(`
         <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
             <h1>Mphatso AI Status: Active 🚀</h1>
-            <p>To link a new device, go to <a href="/qr">/qr</a></p>
+            <p>To link a new device, go to <a href="https://wautomation.onrender.com/qr">/qr</a></p>
         </div>
     `);
 });
