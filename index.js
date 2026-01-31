@@ -1,36 +1,37 @@
 const dns = require('node:dns/promises');
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 
-const { Client, RemoteAuth } = require('whatsapp-web.js');
-const { MongoStore } = require('wwebjs-mongo');
-const mongoose = require('mongoose');
-const qrcodeTerminal = require('qrcode-terminal'); 
-const QRCode = require('qrcode');                 
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-require('dotenv').config();
+const mongoose = require('mongoose');
+const qrcodeTerminal = require('qrcode-terminal');
+const QRCode = require('qrcode');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const {
+    default: makeWASocket,
+    DisconnectReason,
+    makeCacheableSignalKeyStore,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
 
-
-let latestQR = ""; 
+let latestQR = '';
 const chatHistories = new Map();
-const mkenaniLastSpoke = new Map(); 
-
+const mkenaniLastSpoke = new Map();
 
 const app = express();
-const PORT = process.env.PORT || 10000; 
+const PORT = process.env.PORT || 10000;
 
 app.get('/', (req, res) => {
     res.send(`
         <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
             <h1>Mphatso AI Status: Active 🚀</h1>
-            <p>To link a new device, go to <a href="https://wautomation.onrender.com/qr">/qr</a></p>
+            <p>To link a new device, go to <a href="/qr">/qr</a></p>
         </div>
     `);
 });
 
 app.get('/qr', (req, res) => {
-
     if (!latestQR) {
         return res.send("<h1>No QR generated. The bot might already be logged in!</h1>");
     }
@@ -48,6 +49,7 @@ app.get('/qr', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => console.log(`✅ Web Server running on port ${PORT}`));
 
+
 const userSchema = new mongoose.Schema({
     whatsappId: String,
     name: String,
@@ -56,22 +58,31 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
+const authStateSchema = new mongoose.Schema({
+    id: { type: String, default: 'auth_state' },
+    creds: { type: Object, default: {} }
+});
+const AuthState = mongoose.model('AuthState', authStateSchema);
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
 const tools = {
     updateUserProfile: async (whatsappId, name, fact) => {
         const update = {};
         if (name) update.name = name;
+        if (fact) update.$push = { facts: fact };
+
         const user = await User.findOneAndUpdate(
-            { whatsappId }, 
-            { $set: update, $push: fact ? { facts: fact } : {} },
+            { whatsappId },
+            update,
             { upsert: true, new: true }
         );
-        return `Updated profile for ${user.name || whatsappId}`;
+        return `Profile updated: ${user.name || whatsappId} – facts: ${user.facts.join(', ')}`;
     }
 };
 
-const model = genAI.getGenerativeModel({ 
-    model: "gemini-2.5-flash", 
+const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
     tools: [{
         functionDeclarations: [{
             name: "updateUserProfile",
@@ -81,11 +92,13 @@ const model = genAI.getGenerativeModel({
                 properties: {
                     name: { type: "STRING", description: "The user's name." },
                     fact: { type: "STRING", description: "A fact to remember." }
-                }
+                },
+                required: []
             }
         }]
     }],
-    generationConfig: { maxOutputTokens: 80 }
+    generationConfig: { maxOutputTokens: 150 },
+    systemInstruction: "You are Mphatso, personal assistant to mkenani. Be brief (1-2 sentences), witty, and helpful."
 });
 
 function getMkenaniStatus() {
@@ -95,96 +108,121 @@ function getMkenaniStatus() {
     return "currently busy 🛠️";
 }
 
-mongoose.connect(process.env.MONGODB_URI).then(() => {
-    console.log('✅ Connected to MongoDB Atlas');
+// WhatsApp Connection
+async function connectToWhatsApp() {
+    const logger = pino({ level: 'silent' });
 
-    const client = new Client({
-        authStrategy: new RemoteAuth({
-            store: new MongoStore({ mongoose }),
-            backupSyncIntervalMs: 300000 
-        }),
- puppeteer: {
-    headless: true,
-    args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
-    ],
+    const authDoc = await AuthState.findOne({ id: 'auth_state' }) ||
+                    await new AuthState({ id: 'auth_state' }).save();
 
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
+    const saveCreds = async () => {
+        authDoc.creds = sock.authState.creds;
+        await authDoc.save();
+    };
+
+    const sock = makeWASocket({
+        auth: {
+            creds: authDoc.creds,
+            keys: makeCacheableSignalKeyStore({}, logger),
+        },
+        printQRInTerminal: false,
+        logger,
+        browser: ['Mphatso AI', 'Chrome', '120.0'],
     });
 
-    client.on('qr', (qr) => {
-        latestQR = qr; 
-        console.log('⚡ New QR received. Scan at /qr');
-        qrcodeTerminal.generate(qr, { small: false });
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            latestQR = qr;
+            console.log('⚡ New QR received. Scan at /qr');
+            qrcodeTerminal.generate(qr, { small: true });
+        }
+
+        if (connection === 'close') {
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            if (statusCode !== DisconnectReason.loggedOut) {
+                connectToWhatsApp();
+            } else {
+                console.log('Logged out – clearing session');
+                AuthState.deleteOne({ id: 'auth_state' }).then(() => connectToWhatsApp());
+            }
+        } else if (connection === 'open') {
+            latestQR = '';
+            console.log('🚀 Mphatso is online!');
+        }
     });
 
-    client.on('ready', () => {
-        latestQR = ""; 
-        console.log('🚀 Mphatso is online!');
-    });
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.message) return;
 
-    client.on('message', async (msg) => {
-        if (msg.from.endsWith('@g.us') || msg.isStatus) return;
-        
-        if (msg.fromMe) {
-            mkenaniLastSpoke.set(msg.to, Date.now());
+        const from = msg.key.remoteJid;
+        if (from.endsWith('@g.us') || from === 'status@broadcast') return;
+
+        const text = msg.message.conversation ||
+                     msg.message.extendedTextMessage?.text ||
+                     '';
+
+        if (msg.key.fromMe) {
+            mkenaniLastSpoke.set(from, Date.now());
             return;
         }
 
-        const lastMeTime = mkenaniLastSpoke.get(msg.from) || 0;
-        const cooldown = 50 * 60 * 1000; 
+        const lastMeTime = mkenaniLastSpoke.get(from) || 0;
+        const cooldown = 50 * 60 * 1000;
         if (Date.now() - lastMeTime < cooldown) return;
 
         try {
-            const chat = await msg.getChat();
-            await chat.sendStateTyping();
+            await sock.sendPresenceUpdate('composing', from);
 
-            let userProfile = await User.findOne({ whatsappId: msg.from }) || 
-                              await User.create({ whatsappId: msg.from, facts: [] });
+            let userProfile = await User.findOne({ whatsappId: from }) ||
+                              await User.create({ whatsappId: from, facts: [] });
 
-            const systemInstruction = `
-                Your name is Mphatso, personal assistant to mkenani. 
-                STATUS: mkenani is ${getMkenaniStatus()}.
-                USER: ${userProfile.name || "Unknown"}.
-                KNOWN FACTS: ${userProfile.facts.join(", ")}.
-                RULES: Brief (2 sentences), witty.
-            `;
-
-            if (!chatHistories.has(msg.from)) {
-                chatHistories.set(msg.from, model.startChat({ history: [] }));
+            let chat = chatHistories.get(from);
+            if (!chat) {
+                chat = model.startChat({});
+                chatHistories.set(from, chat);
             }
-            const userChat = chatHistories.get(msg.from);
 
-            const result = await userChat.sendMessage([
-                { text: systemInstruction },
-                { text: msg.body }
-            ]);
+            const dynamicPrompt = `Current status: mkenani is ${getMkenaniStatus()}.\n` +
+                                 `User name: ${userProfile.name || 'Unknown'}.\n` +
+                                 `Known facts: ${userProfile.facts.join(', ') || 'None'}.\n\n` +
+                                 `User message: ${text}`;
 
-            const call = result.response.functionCalls()?.[0];
+            let result = await chat.sendMessage(dynamicPrompt);
+            let responseText = result.response.text();
 
-            if (call && call.name === "updateUserProfile") {
-                const { name, fact } = call.args;
-                await tools.updateUserProfile(msg.from, name, fact);
-                const followUp = await userChat.sendMessage("Confirm in 1 sentence.");
-                await msg.reply(`*AI:* ${followUp.response.text()}`);
-            } else {
-                await msg.reply(`*AI:* ${result.response.text()}`);
+            const functionCalls = result.response.functionCalls();
+            if (functionCalls?.length) {
+                for (const fc of functionCalls) {
+                    if (fc.name === 'updateUserProfile') {
+                        const args = fc.args || {};
+                        const toolResult = await tools.updateUserProfile(from, args.name, args.fact);
+
+                        const continueResult = await chat.sendMessage({
+                            functionResponse: {
+                                name: fc.name,
+                                response: { result: toolResult }
+                            }
+                        });
+                        responseText = continueResult.response.text();
+                    }
+                }
             }
+
+            await sock.sendMessage(from, { text: `*AI:* ${responseText}` });
 
         } catch (error) {
-            console.error("Bot Error:", error);
+            console.error('Message handling error:', error);
         }
     });
-
-    client.initialize();
+}
+mongoose.connect(process.env.MONGODB_URI).then(async () => {
+    console.log('✅ Connected to MongoDB Atlas');
+    connectToWhatsApp();
 });
 
 setInterval(() => {
