@@ -21,7 +21,7 @@ let db, sessionCol, userCol;
 
 // AI Setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // Helper: Delay
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -37,53 +37,60 @@ async function processQueue(sock) {
     const { m, sender, text } = messageQueue.shift();
 
     try {
-        // --- USER MEMORY FETCH ---
-        let userData = await userCol.findOne({ whatsappId: sender });
+        // 1. Fetch/Create User Memory
+        let userData = await userCol.findOne({ _id: sender });
         if (!userData) {
-            userData = { whatsappId: sender, name: "New Friend", facts: [] };
+            userData = { _id: sender, name: "Unknown", facts: [], firstSeen: new Date() };
             await userCol.insertOne(userData);
         }
 
         const hour = new Date().getHours();
         const bossStatus = (hour >= 23 || hour <= 6) ? "sleeping 😴" : (hour >= 9 && hour <= 17) ? "focus mode 👨‍💻" : "busy 🛠️";
 
-        // Show Typing indicator
+        // 2. Premium Human Presence
+        // We wait a bit before "Typing" to look like we are reading
+        await delay(1500); 
         await sock.sendPresenceUpdate('composing', sender);
 
         const systemInstruction = `
-            Your name is Mphatso, assistant to mkenani.
-            mkenani is ${bossStatus}.
-            User Info: Name is ${userData.name}, Facts: ${userData.facts.join(", ") || "None yet"}.
-            Instructions: Be friendly, witty, and helpful. Mention their name if known.
-            STRICT LIMIT: Max 2 lines. 
+            Your name is Mphatso, personal assistant to mkenani.
+            Boss Status: mkenani is currently ${bossStatus}.
+            User Memory: Name is "${userData.name}". Facts: ${userData.facts.join(", ") || "None yet"}.
+            
+            GOALS:
+            1. Be helpful, witty, and extremely friendly.
+            2. If you don't know the user's name, ask for it naturally.
+            3. If they tell you a fact about themselves, acknowledge it.
+            4. Keep responses under 2 lines. 
         `;
 
-        const result = await model.generateContent(`${systemInstruction}\n\nUser Message: ${text}`);
+        const result = await model.generateContent(`${systemInstruction}\n\nUser: ${text}`);
         let responseText = result.response.text().trim().split('\n').slice(0, 2).join('\n');
 
-        // Fast typing simulation
-        const typingTime = Math.min(Math.max(responseText.length * 25, 800), 3000);
-        await delay(typingTime);
+        // 3. Humanized Typing Speed (Calculated by length)
+        const typingDuration = Math.min(Math.max(responseText.length * 60, 2000), 6000);
+        await delay(typingDuration);
 
-        // --- SEND REPLY QUOTING THE MESSAGE ---
-        await sock.sendMessage(sender, { 
-            text: responseText 
-        }, { 
-            quoted: m 
-        });
+        // 4. Send Reply (Quoted for clarity)
+        await sock.sendMessage(sender, { text: responseText }, { quoted: m });
 
-        await sock.sendPresenceUpdate('paused', sender);
+        // 5. Update Memory if AI detected a name or fact (Background process)
+        if (text.toLowerCase().includes("my name is") || text.toLowerCase().includes("i am")) {
+            const nameMatch = text.match(/(?:my name is|i am)\s+([a-zA-Z]+)/i);
+            if (nameMatch) await userCol.updateOne({ _id: sender }, { $set: { name: nameMatch[1] } });
+        }
 
     } catch (err) {
-        console.error("Mphatso Queue Error:", err.message);
-        await sock.sendPresenceUpdate('paused', sender);
+        console.error("Mphatso Premium Error:", err.message);
+    } finally {
+        // We leave the status alone for a few seconds before finishing to look natural
+        await delay(1000);
+        isProcessing = false;
+        processQueue(sock);
     }
-
-    isProcessing = false;
-    processQueue(sock);
 }
 
-// --- MONGODB AUTH (Separate Collections) ---
+// --- MONGODB AUTH STORAGE ---
 async function useMongoDBAuthState(collection) {
     const writeData = (data, id) => collection.replaceOne({ _id: id }, { data: JSON.stringify(data, BufferJSON.replacer) }, { upsert: true });
     const readData = async (id) => {
@@ -126,12 +133,12 @@ async function useMongoDBAuthState(collection) {
     };
 }
 
-// --- START BOT ---
+// --- START ENGINE ---
 async function startBot() {
     try {
         const mClient = new MongoClient(process.env.MONGODB_URI);
         await mClient.connect();
-        db = mClient.db('mphatso_v2'); 
+        db = mClient.db('MphatsoAssistant'); 
         sessionCol = db.collection('auth_session'); 
         userCol = db.collection('user_memory');    
 
@@ -142,8 +149,8 @@ async function startBot() {
             version,
             auth: state,
             logger: P({ level: 'error' }),
-            browser: ['Mphatso Assistant', 'Chrome', '1.0.0'],
-            markOnlineOnConnect: false
+            browser: ['Mphatso Premium', 'Chrome', '1.0.0'],
+            markOnlineOnConnect: false // Stay offline to look like a person
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -157,14 +164,13 @@ async function startBot() {
                 if (shouldReconnect) startBot();
             } else if (connection === 'open') {
                 qrCode = "";
-                console.log('🚀 MPHATSO IS CONNECTED');
+                console.log('🚀 MPHATSO PREMIUM IS LIVE');
             }
         });
 
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             const m = messages[0];
-            
-            // 1. Skip if empty, from yourself, or FROM A GROUP (@g.us)
+            // Rule: No groups, no self, only notifications
             if (!m.message || m.key.fromMe || m.key.remoteJid.endsWith('@g.us') || type !== 'notify') return;
 
             const text = m.message.conversation || m.message.extendedTextMessage?.text || "";
@@ -175,18 +181,16 @@ async function startBot() {
         });
 
     } catch (err) {
-        console.error("Bot Start Fail:", err);
+        console.error("Engine Start Fail:", err);
         setTimeout(startBot, 10000);
     }
 }
 
-// Routes
-app.get('/', (req, res) => res.send('Mphatso AI v2 is running. Status: Active'));
+// Web Routes
+app.get('/', (req, res) => res.send('Premium Assistant: Active'));
 app.get('/qr', async (req, res) => {
-    if (!qrCode) return res.send('<h1>Connected!</h1>');
-    QRCode.toDataURL(qrCode, (err, url) => {
-        res.send(`<div style="text-align:center;"><h2>Scan to Link Account</h2><img src="${url}"/></div>`);
-    });
+    if (!qrCode) return res.send('Connected.');
+    QRCode.toDataURL(qrCode, (err, url) => res.send(`<img src="${url}">`));
 });
 
 app.listen(PORT, '0.0.0.0', () => startBot());
